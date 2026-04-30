@@ -1,8 +1,9 @@
 import os
 import uuid
 import threading
+import time
+import requests
 from flask import Flask, request, jsonify, render_template, send_file
-import assemblyai as aai
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 600 * 1024 * 1024  # 600MB
@@ -12,47 +13,79 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 jobs = {}  # in-memory store: job_id -> job dict
 
-aai.settings.api_key = os.environ.get('ASSEMBLYAI_API_KEY', '')
+ASSEMBLYAI_KEY = os.environ.get('ASSEMBLYAI_API_KEY', '')
+AAI_HEADERS = {'Authorization': ASSEMBLYAI_KEY}
+
+
+def upload_to_assemblyai(file_path):
+    """Upload file to AssemblyAI and return the audio URL."""
+    with open(file_path, 'rb') as f:
+        res = requests.post(
+            'https://api.assemblyai.com/v2/upload',
+            headers=AAI_HEADERS,
+            data=f,
+        )
+    res.raise_for_status()
+    return res.json()['upload_url']
 
 
 def process_transcription(job_id, file_path):
     try:
         jobs[job_id]['status'] = 'processing'
 
-        config = aai.TranscriptionConfig(
-            speaker_labels=True,
-            language_detection=True,
-            speech_model="universal-2",
+        # Upload file to AssemblyAI
+        audio_url = upload_to_assemblyai(file_path)
+
+        # Submit transcription job
+        res = requests.post(
+            'https://api.assemblyai.com/v2/transcript',
+            headers={**AAI_HEADERS, 'Content-Type': 'application/json'},
+            json={
+                'audio_url': audio_url,
+                'speaker_labels': True,
+                'language_detection': True,
+                'speech_model': 'universal-2',
+            },
         )
+        res.raise_for_status()
+        transcript_id = res.json()['id']
 
-        transcriber = aai.Transcriber(config=config)
-        transcript = transcriber.transcribe(file_path)
+        # Poll until complete
+        while True:
+            poll = requests.get(
+                f'https://api.assemblyai.com/v2/transcript/{transcript_id}',
+                headers=AAI_HEADERS,
+            )
+            poll.raise_for_status()
+            data = poll.json()
 
-        if transcript.status == aai.TranscriptStatus.error:
-            jobs[job_id].update({'status': 'error', 'error': transcript.error})
-            return
+            if data['status'] == 'completed':
+                break
+            elif data['status'] == 'error':
+                jobs[job_id].update({'status': 'error', 'error': data.get('error', 'Unknown error')})
+                return
 
+            time.sleep(5)
+
+        # Parse utterances
         utterances = []
-        if transcript.utterances:
-            for u in transcript.utterances:
-                words = []
-                if u.words:
-                    words = [
-                        {'text': w.text, 'start': w.start / 1000.0, 'end': w.end / 1000.0}
-                        for w in u.words
-                    ]
-                utterances.append({
-                    'speaker': u.speaker,
-                    'text': u.text,
-                    'start': u.start / 1000.0,
-                    'end': u.end / 1000.0,
-                    'words': words,
-                })
+        for u in data.get('utterances') or []:
+            words = [
+                {'text': w['text'], 'start': w['start'] / 1000.0, 'end': w['end'] / 1000.0}
+                for w in u.get('words', [])
+            ]
+            utterances.append({
+                'speaker': u['speaker'],
+                'text': u['text'],
+                'start': u['start'] / 1000.0,
+                'end': u['end'] / 1000.0,
+                'words': words,
+            })
 
         jobs[job_id].update({
             'status': 'completed',
             'utterances': utterances,
-            'language': getattr(transcript, 'language_code', 'unknown'),
+            'language': data.get('language_code', 'unknown'),
         })
 
     except Exception as e:
