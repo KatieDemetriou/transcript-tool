@@ -29,7 +29,11 @@ const playerFilename     = document.getElementById('player-filename');
 
 // ── File selection ──────────────────────────────────────────────
 
-uploadArea.addEventListener('click', () => fileInput.click());
+uploadArea.addEventListener('click', e => {
+  // Don't re-open picker if clicking the button inside or the preview area
+  if (e.target.closest('button') || e.target.closest('.file-preview')) return;
+  fileInput.click();
+});
 
 uploadArea.addEventListener('dragover', e => {
   e.preventDefault();
@@ -44,6 +48,9 @@ uploadArea.addEventListener('drop', e => {
   const file = e.dataTransfer.files[0];
   if (file) setFile(file);
 });
+
+// Prevent clicks inside file-preview from bubbling to uploadArea
+document.getElementById('file-preview').addEventListener('click', e => e.stopPropagation());
 
 fileInput.addEventListener('change', e => {
   if (e.target.files[0]) setFile(e.target.files[0]);
